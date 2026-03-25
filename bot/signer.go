@@ -169,9 +169,44 @@ func bulkBroadcast(proxyURL string, txs []*Transaction, privKey ed25519.PrivateK
 	}
 	var result struct {
 		Data struct {
-			TxsHashes []string `json:"txsHashes"`
+			TxsHashes map[string]string `json:"txsHashes"`
 		} `json:"data"`
+		Error string `json:"error"`
 	}
-	json.Unmarshal(resp, &result)
-	return result.Data.TxsHashes, nil
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal error: %v, body: %s", err, string(resp))
+	}
+	if result.Error != "" {
+		return nil, fmt.Errorf("proxy: %s", result.Error)
+	}
+	
+	// send-multiple actually returns a map of index -> hash or something similar depending on API version
+	// Let's just create a list of hashes. Sometimes it's a map. Let's try map or just return body if empty
+	if len(result.Data.TxsHashes) == 0 {
+		var fallbackResult struct {
+			Data struct {
+				NumOfTxs int `json:"numOfTxs"`
+				TxsHashes map[string]string `json:"txsHashes"`
+			} `json:"data"`
+			Error string `json:"error"`
+		}
+		json.Unmarshal(resp, &fallbackResult)
+		if fallbackResult.Error != "" {
+			return nil, fmt.Errorf("proxy: %s", fallbackResult.Error)
+		}
+		if fallbackResult.Data.NumOfTxs == 0 {
+			return nil, fmt.Errorf("proxy accepted 0 txs: %s", string(resp))
+		}
+		hashes := make([]string, 0, len(txs))
+		for _, h := range fallbackResult.Data.TxsHashes {
+			hashes = append(hashes, h)
+		}
+		return hashes, nil
+	}
+	
+	hashes := make([]string, 0, len(result.Data.TxsHashes))
+	for _, h := range result.Data.TxsHashes {
+		hashes = append(hashes, h)
+	}
+	return hashes, nil
 }

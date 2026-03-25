@@ -27,7 +27,7 @@ type ShardConfig struct {
 }
 
 var (
-	proxy    = "https://gateway.battleofnodes.com"
+	proxy    = "http://127.0.0.1:7950"
 	chainID  = "B"
 	gasPrice = uint64(1_000_000_000)
 	gasLimit = uint64(10_000_000)
@@ -78,6 +78,17 @@ func (nm *NonceManager) Next() uint64 {
 	n := nm.nonce
 	nm.nonce++
 	return n
+}
+
+func (nm *NonceManager) NextBatch(size int) []uint64 {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	res := make([]uint64, size)
+	for i := 0; i < size; i++ {
+		res[i] = nm.nonce
+		nm.nonce++
+	}
+	return res
 }
 
 // Reset fetches the current on-chain nonce and resets local state.
@@ -223,13 +234,11 @@ func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.D
 
 func (w *ShardWorker) sendBatch(batchSize int) {
 	var txs []*Transaction
-	var nonces []uint64
+	nonces := w.nonces.NextBatch(batchSize)
 	data := buildESDTCall(wegldToken, txAmount, w.callType)
 	
 	for i := 0; i < batchSize; i++ {
-		nonce := w.nonces.Next()
-		nonces = append(nonces, nonce)
-		tx := NewTx(nonce, w.cfg.WalletAddress, w.cfg.ContractAddress, "0", gasPrice, gasLimit, data, chainID, 2)
+		tx := NewTx(nonces[i], w.cfg.WalletAddress, w.cfg.ContractAddress, "0", gasPrice, gasLimit, data, chainID, 2)
 		txs = append(txs, tx)
 	}
 
