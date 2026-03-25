@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,9 +32,8 @@ var (
 
 type ShardConfig struct {
 	ShardID         int
-	PEMFile         string
+	WalletsDir      string
 	ContractAddress string
-	WalletAddress   string
 }
 
 var (
@@ -46,21 +46,18 @@ var (
 	shards = []ShardConfig{
 		{
 			ShardID:         0,
-			PEMFile:         "/root/wallets/shard0.pem",
+			WalletsDir:      "/root/wallets/shard0",
 			ContractAddress: "erd1qqqqqqqqqqqqqpgqhhhyje8gun3r4zuf25x3z3rl6rky0sfac57qw5pjnw",
-			WalletAddress:   "erd12k35xfk0k6en6rfzhfjtvespsm73vhwd3zy4acnwyjlqvrw3c57qtj0rex",
 		},
 		{
 			ShardID:         1,
-			PEMFile:         "/root/wallets/shard1.pem",
+			WalletsDir:      "/root/wallets/shard1",
 			ContractAddress: "erd1qqqqqqqqqqqqqpgqawj0d0vyeseh2avcg4lfvdsmjtgdxpsh9tdsxwc6ef",
-			WalletAddress:   "erd17dgrw3udskg4q07wharx938nrssrr00722d8dc8xtml5dmuq9tdstjq33k",
 		},
 		{
 			ShardID:         2,
-			PEMFile:         "/root/wallets/shard2.pem",
+			WalletsDir:      "/root/wallets/shard2",
 			ContractAddress: "erd1qqqqqqqqqqqqqpgqfevad6stfzucutz0xvzw360nwjfqj3q57laqej9a0z",
-			WalletAddress:   "erd1fcdnxc2qklv9c0dh6thr7gzaq90f4r5se6s0alfd0aj6emzn7laqumqzzp",
 		},
 	}
 )
@@ -186,7 +183,7 @@ func fetchWEGLDBalance(proxy, address, tokenID string) (*big.Int, error) {
 }
 
 // dispatchTx builds, signs, and broadcasts a single transaction.
-func dispatchTx(proxy string, shard ShardConfig, privKey ed25519.PrivateKey, nonce uint64, data string, value *big.Int) (string, error) {
+func dispatchTx(proxy string, w *ShardWorker, nonce uint64, data string, value *big.Int) (string, error) {
 	valueStr := "0"
 	if value != nil && value.Sign() > 0 {
 		valueStr = value.String()
@@ -197,38 +194,58 @@ func dispatchTx(proxy string, shard ShardConfig, privKey ed25519.PrivateKey, non
 		gp = boostGasPrice
 	}
 	
-	tx := NewTx(nonce, shard.WalletAddress, shard.ContractAddress, valueStr, gp, gasLimit, data, chainID, 2)
-	return broadcast(proxy, tx, privKey)
+	tx := NewTx(nonce, w.walletAddr, w.cfg.ContractAddress, valueStr, gp, gasLimit, data, chainID, 2)
+	return broadcast(proxy, tx, w.privKey)
 }
 
 // ─── SHARD WORKER ────────────────────────────────────────────────────────────
 
 type ShardWorker struct {
-	cfg      ShardConfig
-	privKey  ed25519.PrivateKey
-	nonces   *NonceManager
-	txCount  atomic.Int64
-	errCount atomic.Int64
-	callTypes []string
+	cfg        ShardConfig
+	privKey    ed25519.PrivateKey
+	walletAddr string
+	nonces     *NonceManager
+	txCount    atomic.Int64
+	errCount   atomic.Int64
+	callTypes      []string
 	callTypeCounts []*atomic.Int64
-	batchIndex uint64
-	proxy string
+	batchIndex     uint64
+	proxy          string
 }
 
-func NewShardWorker(proxy string, cfg ShardConfig, callTypes []string) (*ShardWorker, error) {
-	privKey, _, err := parsePEM(cfg.PEMFile)
+func NewShardWorker(proxy string, cfg ShardConfig, pemFile string, callTypes []string) (*ShardWorker, error) {
+	privKey, walletAddr, err := parsePEM(pemFile)
 	if err != nil {
-		return nil, fmt.Errorf("shard%d: parse PEM: %w", cfg.ShardID, err)
+		return nil, fmt.Errorf("shard%d: parse PEM %s: %w", cfg.ShardID, pemFile, err)
 	}
-	nm, err := NewNonceManager(proxy, cfg.WalletAddress)
+	nm, err := NewNonceManager(proxy, walletAddr)
 	if err != nil {
-		return nil, fmt.Errorf("shard%d: fetch nonce: %w", cfg.ShardID, err)
+		return nil, fmt.Errorf("shard%d: fetch nonce %s: %w", cfg.ShardID, walletAddr, err)
 	}
 	counts := make([]*atomic.Int64, len(callTypes))
 	for i := range counts {
 		counts[i] = &atomic.Int64{}
 	}
-	return &ShardWorker{cfg: cfg, privKey: privKey, nonces: nm, callTypes: callTypes, callTypeCounts: counts, proxy: proxy}, nil
+	return &ShardWorker{cfg: cfg, privKey: privKey, walletAddr: walletAddr, nonces: nm, callTypes: callTypes, callTypeCounts: counts, proxy: proxy}, nil
+}
+
+// loadShardWorkers reads all PEM files in the shard's WalletsDir and creates one worker per wallet.
+func loadShardWorkers(proxy string, cfg ShardConfig, callTypes []string) ([]*ShardWorker, error) {
+	entries, err := filepath.Glob(filepath.Join(cfg.WalletsDir, "*.pem"))
+	if err != nil || len(entries) == 0 {
+		return nil, fmt.Errorf("shard%d: no PEM files in %s", cfg.ShardID, cfg.WalletsDir)
+	}
+	var workers []*ShardWorker
+	for _, pem := range entries {
+		w, err := NewShardWorker(proxy, cfg, pem, callTypes)
+		if err != nil {
+			log.Printf("[Shard%d] WARN skip %s: %v", cfg.ShardID, pem, err)
+			continue
+		}
+		workers = append(workers, w)
+	}
+	log.Printf("[Shard%d] Loaded %d wallets from %s", cfg.ShardID, len(workers), cfg.WalletsDir)
+	return workers, nil
 }
 
 // Run fires transactions as fast as possible until ctx is closed.
@@ -288,7 +305,7 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	}
 
 	for i := 0; i < batchSize; i++ {
-		tx := NewTx(nonces[i], w.cfg.WalletAddress, w.cfg.ContractAddress, "0", gp, gasLimit, data, chainID, 2)
+		tx := NewTx(nonces[i], w.walletAddr, w.cfg.ContractAddress, "0", gp, gasLimit, data, chainID, 2)
 		txs = append(txs, tx)
 	}
 
@@ -297,7 +314,7 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 		w.errCount.Add(int64(batchSize))
 		errStr := err.Error()
 		if strings.Contains(errStr, "nonce too low") || strings.Contains(errStr, "nonce too high") {
-			w.nonces.Reset(w.cfg.WalletAddress)
+			w.nonces.Reset(w.walletAddr)
 		}
 		log.Printf("[Shard%d] ERROR batch %d txs: %v", w.cfg.ShardID, batchSize, err)
 		return
@@ -323,9 +340,9 @@ func DrainWorker(proxy string, workers []*ShardWorker, interval time.Duration, s
 			return
 		case <-ticker.C:
 			for _, w := range workers {
-				// Claim Developer Rewards (All Shards)
+				// Claim Developer Rewards (All Shards) - use first worker per shard
 				nonceReward := w.nonces.Next()
-				hashReward, errReward := dispatchTx(proxy, w.cfg, w.privKey, nonceReward, "ClaimDeveloperRewards", nil)
+				hashReward, errReward := dispatchTx(proxy, w, nonceReward, "ClaimDeveloperRewards", nil)
 				if errReward != nil {
 					log.Printf("[Drain] Shard%d Rewards ERROR: %v", w.cfg.ShardID, errReward)
 				} else {
@@ -338,7 +355,7 @@ func DrainWorker(proxy string, workers []*ShardWorker, interval time.Duration, s
 				// Drain USDC
 				nonce1 := w.nonces.Next()
 				drainUSDC := fmt.Sprintf("drain@%s", hexEncode("USDC-c76f1f"))
-				hash1, err1 := dispatchTx(proxy, w.cfg, w.privKey, nonce1, drainUSDC, nil)
+				hash1, err1 := dispatchTx(proxy, w, nonce1, drainUSDC, nil)
 				if err1 != nil {
 					log.Printf("[Drain] Shard%d USDC ERROR: %v", w.cfg.ShardID, err1)
 				} else {
@@ -348,7 +365,7 @@ func DrainWorker(proxy string, workers []*ShardWorker, interval time.Duration, s
 				// Drain WEGLD
 				nonce2 := w.nonces.Next()
 				drainWEGLD := fmt.Sprintf("drain@%s", hexEncode(wegldToken))
-				hash2, err2 := dispatchTx(proxy, w.cfg, w.privKey, nonce2, drainWEGLD, nil)
+				hash2, err2 := dispatchTx(proxy, w, nonce2, drainWEGLD, nil)
 				if err2 != nil {
 					log.Printf("[Drain] Shard%d WEGLD ERROR: %v", w.cfg.ShardID, err2)
 				} else {
@@ -402,13 +419,15 @@ func main() {
 	var allWorkers []*ShardWorker
 	for _, cfg := range shards {
 		ct := shardCallTypes[cfg.ShardID]
-		w, err := NewShardWorker(*proxyFlag, cfg, ct)
+		shardWorkers, err := loadShardWorkers(*proxyFlag, cfg, ct)
 		if err != nil {
 			log.Fatalf("Init shard%d: %v", cfg.ShardID, err)
 		}
-		allWorkers = append(allWorkers, w)
-		wg.Add(1)
-		go w.Run(stopCh, &wg, txInterval, *batchSizeFlag)
+		for _, w := range shardWorkers {
+			allWorkers = append(allWorkers, w)
+			wg.Add(1)
+			go w.Run(stopCh, &wg, txInterval, *batchSizeFlag)
+		}
 	}
 
 	// Start Prometheus metrics server on :2112
