@@ -210,6 +210,7 @@ type ShardWorker struct {
 	txCount  atomic.Int64
 	errCount atomic.Int64
 	callTypes []string
+	callTypeCounts []*atomic.Int64
 	batchIndex uint64
 	proxy string
 }
@@ -223,7 +224,11 @@ func NewShardWorker(proxy string, cfg ShardConfig, callTypes []string) (*ShardWo
 	if err != nil {
 		return nil, fmt.Errorf("shard%d: fetch nonce: %w", cfg.ShardID, err)
 	}
-	return &ShardWorker{cfg: cfg, privKey: privKey, nonces: nm, callTypes: callTypes, proxy: proxy}, nil
+	counts := make([]*atomic.Int64, len(callTypes))
+	for i := range counts {
+		counts[i] = &atomic.Int64{}
+	}
+	return &ShardWorker{cfg: cfg, privKey: privKey, nonces: nm, callTypes: callTypes, callTypeCounts: counts, proxy: proxy}, nil
 }
 
 // Run fires transactions as fast as possible until ctx is closed.
@@ -264,7 +269,8 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	}
 
 	w.batchIndex++
-	ct := w.callTypes[w.batchIndex % uint64(len(w.callTypes))]
+	idx := w.batchIndex % uint64(len(w.callTypes))
+	ct := w.callTypes[idx]
 	
 	sendToken, expectToken, amt := wegldToken, "USDC-c76f1f", txAmountWegld
 	// AUTOMATED WARMUP: strictly use WEGLD for the first 20 seconds to guarantee USDC balance accrual
@@ -299,6 +305,7 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	
 	globalTxsSent.Add(int64(len(hashes)))
 	w.txCount.Add(int64(len(hashes)))
+	w.callTypeCounts[idx].Add(int64(len(hashes)))
 	if len(hashes) > 0 {
 		log.Printf("[Shard%d] OK batch sent %d txs (first nonce=%d, hash=%s, ct=%s, gp=%d, expects=%s)", w.cfg.ShardID, len(hashes), nonces[0], hashes[0], ct, gp, expectToken)
 	}
@@ -408,9 +415,10 @@ func main() {
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		for _, worker := range allWorkers {
-			cTypes := strings.Join(worker.callTypes, ",")
-			fmt.Fprintf(w, "bot_txs_sent_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, cTypes, worker.txCount.Load())
-			fmt.Fprintf(w, "bot_txs_error_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, cTypes, worker.errCount.Load())
+			for i, ct := range worker.callTypes {
+				fmt.Fprintf(w, "bot_txs_sent_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, ct, worker.callTypeCounts[i].Load())
+			}
+			fmt.Fprintf(w, "bot_txs_error_total{shard=\"%d\"} %d\n", worker.cfg.ShardID, worker.errCount.Load())
 		}
 	})
 	go func() {
