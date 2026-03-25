@@ -47,17 +47,17 @@ var (
 		{
 			ShardID:         0,
 			WalletsDir:      "/root/wallets/shard0",
-			ContractAddress: "erd1qqqqqqqqqqqqqpgqhhhyje8gun3r4zuf25x3z3rl6rky0sfac57qw5pjnw",
+			ContractAddress: "erd1qqqqqqqqqqqqqpgqeel2kumf0r8ffyhth7pqdujjat9nx0862jpsg2pqaq",
 		},
 		{
 			ShardID:         1,
 			WalletsDir:      "/root/wallets/shard1",
-			ContractAddress: "erd1qqqqqqqqqqqqqpgqawj0d0vyeseh2avcg4lfvdsmjtgdxpsh9tdsxwc6ef",
+			ContractAddress: "erd1qqqqqqqqqqqqqpgqeel2kumf0r8ffyhth7pqdujjat9nx0862jpsg2pqaq",
 		},
 		{
 			ShardID:         2,
 			WalletsDir:      "/root/wallets/shard2",
-			ContractAddress: "erd1qqqqqqqqqqqqqpgqfevad6stfzucutz0xvzw360nwjfqj3q57laqej9a0z",
+			ContractAddress: "erd1qqqqqqqqqqqqqpgqeel2kumf0r8ffyhth7pqdujjat9nx0862jpsg2pqaq",
 		},
 	}
 )
@@ -403,8 +403,8 @@ func main() {
 
 	shardCallTypes := map[int][]string{
 		0: {"blindAsyncV1", "blindAsyncV2"}, // cross-shard: 2 types
-		1: {"blindSync"},                    // same-shard: 1 type
-		2: {"blindTransfExec"},              // cross-shard: 1 type
+		1: {"blindTransfExec"},              // cross-shard: 1 type
+		2: {"blindSync"},                    // same-shard: 1 type
 	}
 	if *callTypeFlag != "auto" {
 		for k := range shardCallTypes {
