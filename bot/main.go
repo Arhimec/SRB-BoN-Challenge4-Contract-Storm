@@ -369,8 +369,9 @@ func main() {
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		for _, worker := range allWorkers {
-			fmt.Fprintf(w, "bot_txs_sent_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, worker.callType, worker.txCount.Load())
-			fmt.Fprintf(w, "bot_txs_error_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, worker.callType, worker.errCount.Load())
+			cTypes := strings.Join(worker.callTypes, ",")
+			fmt.Fprintf(w, "bot_txs_sent_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, cTypes, worker.txCount.Load())
+			fmt.Fprintf(w, "bot_txs_error_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, cTypes, worker.errCount.Load())
 		}
 	})
 	go func() {
