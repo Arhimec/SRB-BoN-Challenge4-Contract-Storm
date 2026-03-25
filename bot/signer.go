@@ -56,12 +56,69 @@ func parsePEM(path string) (ed25519.PrivateKey, string, error) {
 	return privKey, addr, nil
 }
 
-// bech32Encode converts a 32-byte public key to an erd1... bech32 address.
-// Uses the standard MvX conversion (bech32 with hrp="erd").
+// bech32Encode converts a 32-byte public key to a valid bech32 erd1 address.
 func bech32Encode(hrp string, data []byte) string {
-	// Simplified: use hex embedding. For prod use proper bech32 lib.
-	// We rely on the wallet addresses being provided in config anyway.
-	return hrp + "1" + hex.EncodeToString(data)[:58]
+	const charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+	// convertbits: 8→5
+	conv := func(d []byte) []byte {
+		var out []byte
+		acc, bits := 0, 0
+		for _, v := range d {
+			acc = (acc << 8) | int(v)
+			bits += 8
+			for bits >= 5 {
+				bits -= 5
+				out = append(out, byte((acc>>bits)&31))
+			}
+		}
+		if bits > 0 {
+			out = append(out, byte((acc<<(5-bits))&31))
+		}
+		return out
+	}
+
+	polymod := func(values []byte) uint32 {
+		c := uint32(1)
+		gen := []uint32{0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3}
+		for _, v := range values {
+			b := c >> 25
+			c = (c&0x1ffffff)<<5 ^ uint32(v)
+			for i, g := range gen {
+				if (b>>uint(i))&1 == 1 {
+					c ^= g
+				}
+			}
+		}
+		return c
+	}
+
+	hrpExpand := func(h string) []byte {
+		var r []byte
+		for _, c := range h {
+			r = append(r, byte(c>>5))
+		}
+		r = append(r, 0)
+		for _, c := range h {
+			r = append(r, byte(c&31))
+		}
+		return r
+	}
+
+	words := conv(data)
+	enc := append(hrpExpand(hrp), words...)
+	enc = append(enc, 0, 0, 0, 0, 0, 0)
+	pm := polymod(enc) ^ 1
+	cs := make([]byte, 6)
+	for i := range cs {
+		cs[i] = byte((pm >> (5 * (5 - i))) & 31)
+	}
+	combined := append(words, cs...)
+	out := []byte(hrp + "1")
+	for _, b := range combined {
+		out = append(out, charset[b])
+	}
+	return string(out)
 }
 
 // Transaction represents a signed MultiversX transaction (proxy wire format).
