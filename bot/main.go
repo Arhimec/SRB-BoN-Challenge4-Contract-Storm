@@ -30,7 +30,6 @@ type ShardConfig struct {
 }
 
 var (
-	proxy    = "http://127.0.0.1:7950"
 	chainID  = "B"
 	gasPrice = uint64(1_000_000_000)
 	gasLimit = uint64(10_000_000)
@@ -65,14 +64,15 @@ var (
 type NonceManager struct {
 	mu    sync.Mutex
 	nonce uint64
+	proxy string
 }
 
-func NewNonceManager(address string) (*NonceManager, error) {
-	n, err := fetchNonce(address)
+func NewNonceManager(proxy, address string) (*NonceManager, error) {
+	n, err := fetchNonce(proxy, address)
 	if err != nil {
 		return nil, err
 	}
-	return &NonceManager{nonce: n}, nil
+	return &NonceManager{nonce: n, proxy: proxy}, nil
 }
 
 func (nm *NonceManager) Next() uint64 {
@@ -97,7 +97,7 @@ func (nm *NonceManager) NextBatch(size int) []uint64 {
 // Reset fetches the current on-chain nonce and resets local state.
 // Call this after a nonce error to re-sync.
 func (nm *NonceManager) Reset(address string) {
-	n, err := fetchNonce(address)
+	n, err := fetchNonce(nm.proxy, address)
 	if err != nil {
 		log.Printf("NonceManager.Reset: %v", err)
 		return
@@ -138,7 +138,7 @@ func buildESDTCall(tokenID string, amount *big.Int, fn string, expectedToken str
 
 // ─── NETWORK HELPERS ─────────────────────────────────────────────────────────
 
-func fetchNonce(address string) (uint64, error) {
+func fetchNonce(proxy, address string) (uint64, error) {
 	resp, err := http.Get(fmt.Sprintf("%s/address/%s", proxy, address))
 	if err != nil {
 		return 0, err
@@ -158,7 +158,7 @@ func fetchNonce(address string) (uint64, error) {
 	return result.Data.Account.Nonce, nil
 }
 
-func fetchWEGLDBalance(address, tokenID string) (*big.Int, error) {
+func fetchWEGLDBalance(proxy, address, tokenID string) (*big.Int, error) {
 	url := fmt.Sprintf("%s/address/%s/esdt/%s", proxy, address, tokenID)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -180,7 +180,7 @@ func fetchWEGLDBalance(address, tokenID string) (*big.Int, error) {
 }
 
 // dispatchTx builds, signs, and broadcasts a single transaction.
-func dispatchTx(shard ShardConfig, privKey ed25519.PrivateKey, nonce uint64, data string, value *big.Int) (string, error) {
+func dispatchTx(proxy string, shard ShardConfig, privKey ed25519.PrivateKey, nonce uint64, data string, value *big.Int) (string, error) {
 	valueStr := "0"
 	if value != nil && value.Sign() > 0 {
 		valueStr = value.String()
@@ -199,18 +199,19 @@ type ShardWorker struct {
 	errCount atomic.Int64
 	callTypes []string
 	batchIndex uint64
+	proxy string
 }
 
-func NewShardWorker(cfg ShardConfig, callTypes []string) (*ShardWorker, error) {
+func NewShardWorker(proxy string, cfg ShardConfig, callTypes []string) (*ShardWorker, error) {
 	privKey, _, err := parsePEM(cfg.PEMFile)
 	if err != nil {
 		return nil, fmt.Errorf("shard%d: parse PEM: %w", cfg.ShardID, err)
 	}
-	nm, err := NewNonceManager(cfg.WalletAddress)
+	nm, err := NewNonceManager(proxy, cfg.WalletAddress)
 	if err != nil {
 		return nil, fmt.Errorf("shard%d: fetch nonce: %w", cfg.ShardID, err)
 	}
-	return &ShardWorker{cfg: cfg, privKey: privKey, nonces: nm, callTypes: callTypes}, nil
+	return &ShardWorker{cfg: cfg, privKey: privKey, nonces: nm, callTypes: callTypes, proxy: proxy}, nil
 }
 
 // Run fires transactions as fast as possible until ctx is closed.
@@ -267,7 +268,7 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 		txs = append(txs, tx)
 	}
 
-	hashes, err := bulkBroadcast(proxy, txs, w.privKey)
+	hashes, err := bulkBroadcast(w.proxy, txs, w.privKey)
 	if err != nil {
 		w.errCount.Add(int64(batchSize))
 		errStr := err.Error()
@@ -288,7 +289,7 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 // ─── DRAIN WORKER ────────────────────────────────────────────────────────────
 
 // Cross-shard async calls lock tokens in the contract. Drain releases them.
-func DrainWorker(workers []*ShardWorker, interval time.Duration, stop chan struct{}) {
+func DrainWorker(proxy string, workers []*ShardWorker, interval time.Duration, stop chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -303,7 +304,7 @@ func DrainWorker(workers []*ShardWorker, interval time.Duration, stop chan struc
 				// Drain USDC
 				nonce1 := w.nonces.Next()
 				drainUSDC := fmt.Sprintf("drain@%s", hexEncode("USDC-c76f1f"))
-				hash1, err1 := dispatchTx(w.cfg, w.privKey, nonce1, drainUSDC, nil)
+				hash1, err1 := dispatchTx(proxy, w.cfg, w.privKey, nonce1, drainUSDC, nil)
 				if err1 != nil {
 					log.Printf("[Drain] Shard%d USDC ERROR: %v", w.cfg.ShardID, err1)
 				} else {
@@ -313,7 +314,7 @@ func DrainWorker(workers []*ShardWorker, interval time.Duration, stop chan struc
 				// Drain WEGLD
 				nonce2 := w.nonces.Next()
 				drainWEGLD := fmt.Sprintf("drain@%s", hexEncode(wegldToken))
-				hash2, err2 := dispatchTx(w.cfg, w.privKey, nonce2, drainWEGLD, nil)
+				hash2, err2 := dispatchTx(proxy, w.cfg, w.privKey, nonce2, drainWEGLD, nil)
 				if err2 != nil {
 					log.Printf("[Drain] Shard%d WEGLD ERROR: %v", w.cfg.ShardID, err2)
 				} else {
@@ -333,10 +334,11 @@ func main() {
 	drainIntervalFlag := flag.Int("drain-interval", 6000, "Milliseconds between drain calls")
 	batchSizeFlag := flag.Int("batch-size", 20, "Number of TXs to send in a single bulkBroadcast array")
 	maxTxsFlag := flag.Int64("max-txs", 0, "Stop the bot after reaching this global total of dispatched TXs to preserve gas budget")
+	proxyFlag := flag.String("proxy", "https://gateway.battleofnodes.com", "RPC proxy URL")
 	flag.Parse()
 
 	maxTxsLimit = *maxTxsFlag
-	log.Printf("=== BoN Bot | duration=%v callType=%s interval=%dms batch=%d maxTxs=%d ===", *durationFlag, *callTypeFlag, *intervalMsFlag, *batchSizeFlag, maxTxsLimit)
+	log.Printf("=== BoN Bot | duration=%v callType=%s proxy=%s maxTxs=%d ===", *durationFlag, *callTypeFlag, *proxyFlag, maxTxsLimit)
 
 	shardCallTypes := map[int][]string{
 		0: {"blindAsyncV1", "blindAsyncV2"}, // cross-shard: 2 types
@@ -356,7 +358,7 @@ func main() {
 	var allWorkers []*ShardWorker
 	for _, cfg := range shards {
 		ct := shardCallTypes[cfg.ShardID]
-		w, err := NewShardWorker(cfg, ct)
+		w, err := NewShardWorker(*proxyFlag, cfg, ct)
 		if err != nil {
 			log.Fatalf("Init shard%d: %v", cfg.ShardID, err)
 		}
@@ -382,7 +384,7 @@ func main() {
 	}()
 
 	// Drain worker fires drain() on cross-shard wallets periodically
-	go DrainWorker(allWorkers, time.Duration(*drainIntervalFlag)*time.Millisecond, stopCh)
+	go DrainWorker(*proxyFlag, allWorkers, time.Duration(*drainIntervalFlag)*time.Millisecond, stopCh)
 
 	// Stats every 10 seconds and max limit enforcer
 	go func() {
