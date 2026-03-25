@@ -17,6 +17,9 @@ import (
 	"time"
 )
 
+var globalTxsSent atomic.Int64
+var maxTxsLimit int64
+
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 type ShardConfig struct {
@@ -117,13 +120,15 @@ func amountHex(amount *big.Int) string {
 	return h
 }
 
-// 0.001 WEGLD per call — safe to spam without running out quickly
-var txAmount = new(big.Int).Mul(big.NewInt(1), new(big.Int).Exp(big.NewInt(10), big.NewInt(15), nil))
+// 0.001 WEGLD per call
+var txAmountWegld = new(big.Int).Mul(big.NewInt(1), new(big.Int).Exp(big.NewInt(10), big.NewInt(15), nil))
+// 0.05 USDC per call (50000 units of 6 decimals)
+var txAmountUsdc = big.NewInt(50000)
 
-func buildESDTCall(tokenID string, amount *big.Int, fn string) string {
+func buildESDTCall(tokenID string, amount *big.Int, fn string, expectedToken string) string {
 	destHex := "0000000000000000050019e6ab48171f0381c319cb2ccd108d5ca08ee19c0001" // Target DEX pair
 	endpointHex := hexEncode("swapTokensFixedInput")
-	argTokenHex := hexEncode("USDC-c76f1f")
+	argTokenHex := hexEncode(expectedToken)
 	argAmountHex := "01"
 
 	return fmt.Sprintf("ESDTTransfer@%s@%s@%s@%s@%s@%s@%s", 
@@ -192,10 +197,11 @@ type ShardWorker struct {
 	nonces   *NonceManager
 	txCount  atomic.Int64
 	errCount atomic.Int64
-	callType string
+	callTypes []string
+	batchIndex uint64
 }
 
-func NewShardWorker(cfg ShardConfig, callType string) (*ShardWorker, error) {
+func NewShardWorker(cfg ShardConfig, callTypes []string) (*ShardWorker, error) {
 	privKey, _, err := parsePEM(cfg.PEMFile)
 	if err != nil {
 		return nil, fmt.Errorf("shard%d: parse PEM: %w", cfg.ShardID, err)
@@ -204,14 +210,14 @@ func NewShardWorker(cfg ShardConfig, callType string) (*ShardWorker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("shard%d: fetch nonce: %w", cfg.ShardID, err)
 	}
-	return &ShardWorker{cfg: cfg, privKey: privKey, nonces: nm, callType: callType}, nil
+	return &ShardWorker{cfg: cfg, privKey: privKey, nonces: nm, callTypes: callTypes}, nil
 }
 
 // Run fires transactions as fast as possible until ctx is closed.
 // interval controls tx cadence; set to 0 for max throughput.
 func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.Duration, batchSize int) {
 	defer wg.Done()
-	log.Printf("[Shard%d] Start: callType=%s contract=%s batchSize=%d", w.cfg.ShardID, w.callType, w.cfg.ContractAddress, batchSize)
+	log.Printf("[Shard%d] Start: callTypes=%v contract=%s batchSize=%d", w.cfg.ShardID, w.callTypes, w.cfg.ContractAddress, batchSize)
 
 	if interval == 0 {
 		// fire-and-forget goroutine pool
@@ -240,9 +246,21 @@ func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.D
 }
 
 func (w *ShardWorker) sendBatch(batchSize int) {
+	if maxTxsLimit > 0 && globalTxsSent.Load() >= maxTxsLimit {
+		return // Do not send if max txs explicitly reached
+	}
+
+	w.batchIndex++
+	ct := w.callTypes[w.batchIndex % uint64(len(w.callTypes))]
+	
+	sendToken, expectToken, amt := wegldToken, "USDC-c76f1f", txAmountWegld
+	if w.batchIndex % 2 == 1 {
+		sendToken, expectToken, amt = "USDC-c76f1f", wegldToken, txAmountUsdc
+	}
+
 	var txs []*Transaction
 	nonces := w.nonces.NextBatch(batchSize)
-	data := buildESDTCall(wegldToken, txAmount, w.callType)
+	data := buildESDTCall(sendToken, amt, ct, expectToken)
 	
 	for i := 0; i < batchSize; i++ {
 		tx := NewTx(nonces[i], w.cfg.WalletAddress, w.cfg.ContractAddress, "0", gasPrice, gasLimit, data, chainID, 2)
@@ -260,9 +278,10 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 		return
 	}
 	
+	globalTxsSent.Add(int64(len(hashes)))
 	w.txCount.Add(int64(len(hashes)))
 	if len(hashes) > 0 {
-		log.Printf("[Shard%d] OK batch sent %d txs (first nonce=%d, hash=%s)", w.cfg.ShardID, len(hashes), nonces[0], hashes[0])
+		log.Printf("[Shard%d] OK batch sent %d txs (first nonce=%d, hash=%s, ct=%s)", w.cfg.ShardID, len(hashes), nonces[0], hashes[0], ct)
 	}
 }
 
@@ -313,18 +332,20 @@ func main() {
 	intervalMsFlag := flag.Int("interval", 100, "Milliseconds between TX batches per shard (0=max throughput)")
 	drainIntervalFlag := flag.Int("drain-interval", 6000, "Milliseconds between drain calls")
 	batchSizeFlag := flag.Int("batch-size", 20, "Number of TXs to send in a single bulkBroadcast array")
+	maxTxsFlag := flag.Int64("max-txs", 0, "Stop the bot after reaching this global total of dispatched TXs to preserve gas budget")
 	flag.Parse()
 
-	log.Printf("=== BoN Bot | duration=%v callType=%s interval=%dms batch=%d ===", *durationFlag, *callTypeFlag, *intervalMsFlag, *batchSizeFlag)
+	maxTxsLimit = *maxTxsFlag
+	log.Printf("=== BoN Bot | duration=%v callType=%s interval=%dms batch=%d maxTxs=%d ===", *durationFlag, *callTypeFlag, *intervalMsFlag, *batchSizeFlag, maxTxsLimit)
 
-	shardCallTypes := map[int]string{
-		0: "blindAsyncV2",    // cross-shard: async with drain
-		1: "blindSync",       // same-shard: tokens return automatically
-		2: "blindTransfExec", // cross-shard: transferAndExecute
+	shardCallTypes := map[int][]string{
+		0: {"blindAsyncV1", "blindAsyncV2"}, // cross-shard: 2 types
+		1: {"blindSync"},                    // same-shard: 1 type
+		2: {"blindTransfExec"},              // cross-shard: 1 type
 	}
 	if *callTypeFlag != "auto" {
 		for k := range shardCallTypes {
-			shardCallTypes[k] = *callTypeFlag
+			shardCallTypes[k] = []string{*callTypeFlag}
 		}
 	}
 
@@ -362,9 +383,9 @@ func main() {
 	// Drain worker fires drain() on cross-shard wallets periodically
 	go DrainWorker(allWorkers, time.Duration(*drainIntervalFlag)*time.Millisecond, stopCh)
 
-	// Stats every 10 seconds
+	// Stats every 10 seconds and max limit enforcer
 	go func() {
-		t := time.NewTicker(10 * time.Second)
+		t := time.NewTicker(4 * time.Second)
 		defer t.Stop()
 		for range t.C {
 			total, errs := int64(0), int64(0)
@@ -373,11 +394,22 @@ func main() {
 				errs += w.errCount.Load()
 			}
 			log.Printf("[Stats] TXs=%d Errors=%d", total, errs)
+			if maxTxsLimit > 0 && total >= maxTxsLimit {
+				log.Printf("!!! MAX TX LIMIT %d REACHED, HALTING !!!", maxTxsLimit)
+				close(stopCh)
+				return
+			}
 		}
 	}()
 
-	time.Sleep(*durationFlag)
-	close(stopCh)
+	select {
+	case <-time.After(*durationFlag):
+		log.Println("Duration completed.")
+		close(stopCh)
+	case <-stopCh:
+		// already closed by limit enforcer
+	}
+
 	wg.Wait()
 
 	total := int64(0)
