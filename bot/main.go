@@ -47,17 +47,17 @@ var (
 		{
 			ShardID:         0,
 			WalletsDir:      "/root/wallets/shard0",
-			ContractAddress: "erd1qqqqqqqqqqqqqpgqeel2kumf0r8ffyhth7pqdujjat9nx0862jpsg2pqaq",
+			ContractAddress: "erd1qqqqqqqqqqqqqpgqhhhyje8gun3r4zuf25x3z3rl6rky0sfac57qw5pjnw",
 		},
 		{
 			ShardID:         1,
 			WalletsDir:      "/root/wallets/shard1",
-			ContractAddress: "erd1qqqqqqqqqqqqqpgqeel2kumf0r8ffyhth7pqdujjat9nx0862jpsg2pqaq",
+			ContractAddress: "erd1qqqqqqqqqqqqqpgqawj0d0vyeseh2avcg4lfvdsmjtgdxpsh9tdsxwc6ef",
 		},
 		{
 			ShardID:         2,
 			WalletsDir:      "/root/wallets/shard2",
-			ContractAddress: "erd1qqqqqqqqqqqqqpgqeel2kumf0r8ffyhth7pqdujjat9nx0862jpsg2pqaq",
+			ContractAddress: "erd1qqqqqqqqqqqqqpgqfevad6stfzucutz0xvzw360nwjfqj3q57laqej9a0z",
 		},
 	}
 )
@@ -97,8 +97,6 @@ func (nm *NonceManager) NextBatch(size int) []uint64 {
 	return res
 }
 
-// Reset fetches the current on-chain nonce and resets local state.
-// Call this after a nonce error to re-sync.
 func (nm *NonceManager) Reset(address string) {
 	n, err := fetchNonce(nm.proxy, address)
 	if err != nil {
@@ -123,13 +121,12 @@ func amountHex(amount *big.Int) string {
 	return h
 }
 
-// 0.001 WEGLD per call
 var txAmountWegld = new(big.Int).Mul(big.NewInt(1), new(big.Int).Exp(big.NewInt(10), big.NewInt(15), nil))
-// 0.05 USDC per call (50000 units of 6 decimals)
 var txAmountUsdc = big.NewInt(50000)
 
 func buildESDTCall(tokenID string, amount *big.Int, fn string, expectedToken string) string {
-	destHex := "0000000000000000050019e6ab48171f0381c319cb2ccd108d5ca08ee19c0001" // Target DEX pair
+	// erd1qqqqqqqqqqqqqpgqeel2kumf0r8ffyhth7pqdujjat9nx0862jpsg2pqaq (Shard 2 DEX)
+	destHex := "00000000000000000500ce7eab736978ce9492ebbf8206f252eacb333cfa5483"
 	endpointHex := hexEncode("swapTokensFixedInput")
 	argTokenHex := hexEncode(expectedToken)
 	argAmountHex := "01"
@@ -182,23 +179,27 @@ func fetchWEGLDBalance(proxy, address, tokenID string) (*big.Int, error) {
 	return bal, nil
 }
 
-// dispatchTx builds, signs, and broadcasts a single transaction.
 func dispatchTx(proxy string, w *ShardWorker, nonce uint64, data string, value *big.Int) (string, error) {
 	valueStr := "0"
 	if value != nil && value.Sign() > 0 {
 		valueStr = value.String()
 	}
-	
 	gp := baseGasPrice
 	if globalTxsSent.Load() < boostLimit {
 		gp = boostGasPrice
 	}
-	
 	tx := NewTx(nonce, w.walletAddr, w.cfg.ContractAddress, valueStr, gp, gasLimit, data, chainID, 2)
 	return broadcast(proxy, tx, w.privKey)
 }
 
 // ─── SHARD WORKER ────────────────────────────────────────────────────────────
+
+type WorkerRole string
+const (
+	RoleSpammer WorkerRole = "spammer"
+	RoleDrainer WorkerRole = "drainer"
+	RoleReserve WorkerRole = "reserve"
+)
 
 type ShardWorker struct {
 	cfg        ShardConfig
@@ -207,13 +208,14 @@ type ShardWorker struct {
 	nonces     *NonceManager
 	txCount    atomic.Int64
 	errCount   atomic.Int64
-	callTypes      []string
-	callTypeCounts []*atomic.Int64
-	batchIndex     uint64
-	proxy          string
+	
+	role       WorkerRole
+	callTypes  []string
+	proxy      string
+	batchIdx   uint64
 }
 
-func NewShardWorker(proxy string, cfg ShardConfig, pemFile string, callTypes []string) (*ShardWorker, error) {
+func NewShardWorker(proxy string, cfg ShardConfig, pemFile string, role WorkerRole, callTypes []string) (*ShardWorker, error) {
 	privKey, walletAddr, err := parsePEM(pemFile)
 	if err != nil {
 		return nil, fmt.Errorf("shard%d: parse PEM %s: %w", cfg.ShardID, pemFile, err)
@@ -222,87 +224,103 @@ func NewShardWorker(proxy string, cfg ShardConfig, pemFile string, callTypes []s
 	if err != nil {
 		return nil, fmt.Errorf("shard%d: fetch nonce %s: %w", cfg.ShardID, walletAddr, err)
 	}
-	counts := make([]*atomic.Int64, len(callTypes))
-	for i := range counts {
-		counts[i] = &atomic.Int64{}
-	}
-	return &ShardWorker{cfg: cfg, privKey: privKey, walletAddr: walletAddr, nonces: nm, callTypes: callTypes, callTypeCounts: counts, proxy: proxy}, nil
+	return &ShardWorker{
+		cfg: cfg, privKey: privKey, walletAddr: walletAddr, 
+		nonces: nm, role: role, callTypes: callTypes, proxy: proxy,
+	}, nil
 }
 
-// loadShardWorkers reads all PEM files in the shard's WalletsDir and creates one worker per wallet.
-func loadShardWorkers(proxy string, cfg ShardConfig, callTypes []string) ([]*ShardWorker, error) {
-	entries, err := filepath.Glob(filepath.Join(cfg.WalletsDir, "*.pem"))
-	if err != nil || len(entries) == 0 {
-		return nil, fmt.Errorf("shard%d: no PEM files in %s", cfg.ShardID, cfg.WalletsDir)
-	}
-	var workers []*ShardWorker
-	for _, pem := range entries {
-		w, err := NewShardWorker(proxy, cfg, pem, callTypes)
-		if err != nil {
-			log.Printf("[Shard%d] WARN skip %s: %v", cfg.ShardID, pem, err)
-			continue
+func loadAllShards(proxy string) ([]*ShardWorker, error) {
+	var all []*ShardWorker
+	
+	for _, cfg := range shards {
+		entries, _ := filepath.Glob(filepath.Join(cfg.WalletsDir, "*.pem"))
+		if len(entries) == 0 {
+			return nil, fmt.Errorf("no wallets for shard %d", cfg.ShardID)
 		}
-		workers = append(workers, w)
-	}
-	log.Printf("[Shard%d] Loaded %d wallets from %s", cfg.ShardID, len(workers), cfg.WalletsDir)
-	return workers, nil
-}
-
-// Run fires transactions as fast as possible until ctx is closed.
-// interval controls tx cadence; set to 0 for max throughput.
-func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.Duration, batchSize int) {
-	defer wg.Done()
-	log.Printf("[Shard%d] Start: callTypes=%v contract=%s batchSize=%d", w.cfg.ShardID, w.callTypes, w.cfg.ContractAddress, batchSize)
-
-	if interval == 0 {
-		// fire-and-forget goroutine pool
-		for {
-			select {
-			case <-ctx:
-				log.Printf("[Shard%d] Stop. TXs=%d Errors=%d", w.cfg.ShardID, w.txCount.Load(), w.errCount.Load())
-				return
-			default:
-				w.sendBatch(batchSize)
+		
+		// Partition counts according to user spec
+		var roles []struct {
+			count int
+			role  WorkerRole
+			ct    []string
+		}
+		
+		if cfg.ShardID == 1 {
+			roles = []struct{count int; role WorkerRole; ct []string}{
+				{35, RoleSpammer, []string{"blindSync"}},
+				{5,  RoleSpammer, []string{"blindAsyncV1"}},
+				{5,  RoleSpammer, []string{"blindAsyncV2"}},
+				{3,  RoleSpammer, []string{"blindTransfExec"}},
+				{2,  RoleDrainer, nil},
+			}
+		} else { // Shard 0 and 2
+			roles = []struct{count int; role WorkerRole; ct []string}{
+				{7,  RoleSpammer, []string{"blindAsyncV1"}},
+				{7,  RoleSpammer, []string{"blindAsyncV2"}},
+				{7,  RoleSpammer, []string{"blindTransfExec"}},
+				{3,  RoleDrainer, nil},
+				{1,  RoleReserve, nil},
 			}
 		}
+		
+		idx := 0
+		for _, r := range roles {
+			for i := 0; i < r.count; i++ {
+				if idx >= len(entries) { break }
+				w, err := NewShardWorker(proxy, cfg, entries[idx], r.role, r.ct)
+				if err != nil {
+					log.Printf("[Shard%d] WARN: skip %s: %v", cfg.ShardID, entries[idx], err)
+				} else {
+					all = append(all, w)
+				}
+				idx++
+			}
+		}
+		log.Printf("[Shard%d] Initialized %d workers (Spec applied)", cfg.ShardID, idx)
+	}
+	return all, nil
+}
+
+func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.Duration, batchSize int) {
+	defer wg.Done()
+	if w.role != RoleSpammer {
+		return // Drainers and Reserves don't spam
 	}
 
 	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	if interval == 0 { ticker.Stop() }
+	
 	for {
 		select {
 		case <-ctx:
-			log.Printf("[Shard%d] Stop. TXs=%d Errors=%d", w.cfg.ShardID, w.txCount.Load(), w.errCount.Load())
 			return
-		case <-ticker.C:
-			go w.sendBatch(batchSize)
+		default:
+			if interval > 0 { <-ticker.C }
+			w.sendBatch(batchSize)
 		}
 	}
 }
 
 func (w *ShardWorker) sendBatch(batchSize int) {
 	if maxTxsLimit > 0 && globalTxsSent.Load() >= maxTxsLimit {
-		return // Do not send if max txs explicitly reached
+		return 
 	}
 
-	w.batchIndex++
-	idx := w.batchIndex % uint64(len(w.callTypes))
-	ct := w.callTypes[idx]
+	w.batchIdx++
+	ct := w.callTypes[w.batchIdx % uint64(len(w.callTypes))]
 	
-	sendToken, expectToken, amt := wegldToken, "USDC-c76f1f", txAmountWegld
-	// AUTOMATED WARMUP: strictly use WEGLD for the first 20 seconds to guarantee USDC balance accrual
-	if time.Since(appStartTime) > 20*time.Second && w.batchIndex % 2 == 1 {
-		sendToken, expectToken, amt = "USDC-c76f1f", wegldToken, txAmountUsdc
+	sendT, expectT, amt := wegldToken, "USDC-c76f1f", txAmountWegld
+	if time.Since(appStartTime) > 20*time.Second && w.batchIdx % 2 == 1 {
+		sendT, expectT, amt = "USDC-c76f1f", wegldToken, txAmountUsdc
 	}
 
 	var txs []*Transaction
 	nonces := w.nonces.NextBatch(batchSize)
-	data := buildESDTCall(sendToken, amt, ct, expectToken)
+	data := buildESDTCall(sendT, amt, ct, expectT)
 	
 	gp := baseGasPrice
-	if globalTxsSent.Load() < boostLimit {
-		gp = boostGasPrice
-	}
+	if globalTxsSent.Load() < boostLimit { gp = boostGasPrice }
 
 	for i := 0; i < batchSize; i++ {
 		tx := NewTx(nonces[i], w.walletAddr, w.cfg.ContractAddress, "0", gp, gasLimit, data, chainID, 2)
@@ -312,26 +330,17 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	hashes, err := bulkBroadcast(w.proxy, txs, w.privKey)
 	if err != nil {
 		w.errCount.Add(int64(batchSize))
-		errStr := err.Error()
-		if strings.Contains(errStr, "nonce too low") || strings.Contains(errStr, "nonce too high") {
-			w.nonces.Reset(w.walletAddr)
-		}
-		log.Printf("[Shard%d] ERROR batch %d txs: %v", w.cfg.ShardID, batchSize, err)
+		if strings.Contains(err.Error(), "nonce") { w.nonces.Reset(w.walletAddr) }
 		return
 	}
 	
 	globalTxsSent.Add(int64(len(hashes)))
 	w.txCount.Add(int64(len(hashes)))
-	w.callTypeCounts[idx].Add(int64(len(hashes)))
-	if len(hashes) > 0 {
-		log.Printf("[Shard%d] OK batch sent %d txs (first nonce=%d, hash=%s, ct=%s, gp=%d, expects=%s)", w.cfg.ShardID, len(hashes), nonces[0], hashes[0], ct, gp, expectToken)
-	}
 }
 
 // ─── DRAIN WORKER ────────────────────────────────────────────────────────────
 
-// Cross-shard async calls lock tokens in the contract. Drain releases them.
-func DrainWorker(proxy string, workers []*ShardWorker, interval time.Duration, stop chan struct{}) {
+func DrainWorker(proxy string, allWorkers []*ShardWorker, interval time.Duration, stop chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -339,37 +348,27 @@ func DrainWorker(proxy string, workers []*ShardWorker, interval time.Duration, s
 		case <-stop:
 			return
 		case <-ticker.C:
-			for _, w := range workers {
-				// Claim Developer Rewards (All Shards) - use first worker per shard
-				nonceReward := w.nonces.Next()
-				hashReward, errReward := dispatchTx(proxy, w, nonceReward, "ClaimDeveloperRewards", nil)
-				if errReward != nil {
-					log.Printf("[Drain] Shard%d Rewards ERROR: %v", w.cfg.ShardID, errReward)
-				} else {
-					log.Printf("[Drain] Shard%d claimed Dev Rewards hash=%s", w.cfg.ShardID, hashReward)
+			// Claim Dev Rewards (use one drainer per shard)
+			for _, sid := range []int{0, 1, 2} {
+				var target *ShardWorker
+				for _, w := range allWorkers {
+					if w.cfg.ShardID == sid && w.role == RoleDrainer {
+						target = w
+						break
+					}
 				}
-
-				if w.cfg.ShardID == 1 {
-					continue // same-shard: tokens return automatically, no manual drain needed
-				}
-				// Drain USDC
-				nonce1 := w.nonces.Next()
-				drainUSDC := fmt.Sprintf("drain@%s", hexEncode("USDC-c76f1f"))
-				hash1, err1 := dispatchTx(proxy, w, nonce1, drainUSDC, nil)
-				if err1 != nil {
-					log.Printf("[Drain] Shard%d USDC ERROR: %v", w.cfg.ShardID, err1)
-				} else {
-					log.Printf("[Drain] Shard%d drain USDC sent hash=%s", w.cfg.ShardID, hash1)
-				}
-
-				// Drain WEGLD
-				nonce2 := w.nonces.Next()
-				drainWEGLD := fmt.Sprintf("drain@%s", hexEncode(wegldToken))
-				hash2, err2 := dispatchTx(proxy, w, nonce2, drainWEGLD, nil)
-				if err2 != nil {
-					log.Printf("[Drain] Shard%d WEGLD ERROR: %v", w.cfg.ShardID, err2)
-				} else {
-					log.Printf("[Drain] Shard%d drain WEGLD sent hash=%s", w.cfg.ShardID, hash2)
+				if target == nil { continue }
+				
+				// 1. Claim Rewards
+				n0 := target.nonces.Next()
+				dispatchTx(proxy, target, n0, "ClaimDeveloperRewards", nil)
+				
+				// 2. Drain (if not Shard 1 sync)
+				if sid != 1 {
+					n1 := target.nonces.Next()
+					dispatchTx(proxy, target, n1, "drain@"+hexEncode("USDC-c76f1f"), nil)
+					n2 := target.nonces.Next()
+					dispatchTx(proxy, target, n2, "drain@"+hexEncode(wegldToken), nil)
 				}
 			}
 		}
@@ -379,110 +378,53 @@ func DrainWorker(proxy string, workers []*ShardWorker, interval time.Duration, s
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 
 func main() {
-	durationFlag := flag.Duration("duration", 30*time.Minute, "How long to run the bot")
-	callTypeFlag := flag.String("calltype", "auto", "blindSync|blindAsyncV1|blindAsyncV2|blindTransfExec|auto")
-	intervalMsFlag := flag.Int("interval", 100, "Milliseconds between TX batches per shard (0=max throughput)")
-	drainIntervalFlag := flag.Int("drain-interval", 6000, "Milliseconds between drain calls")
-	batchSizeFlag := flag.Int("batch-size", 20, "Number of TXs to send in a single bulkBroadcast array")
-	maxTxsFlag := flag.Int64("max-txs", 0, "Stop the bot after reaching this global total of dispatched TXs to preserve gas budget")
-	proxyFlag := flag.String("proxy", "https://gateway.battleofnodes.com", "RPC proxy URL")
-	
-	gasPriceFlag := flag.Uint64("gas-price", 1_000_000_000, "Base gas price for all transactions")
-	boostLimitFlag := flag.Int64("boost-limit", 3000, "Number of initial transactions to apply boost-gas-price to")
-	boostGasPriceFlag := flag.Uint64("boost-gas-price", 2_000_000_000, "Elevated gas price for the first N transactions to secure the milestone bonus")
+	dur := flag.Duration("duration", 30*time.Minute, "")
+	intv := flag.Int("interval", 100, "")
+	batch := flag.Int("batch-size", 20, "")
+	maxTxs := flag.Int64("max-txs", 0, "")
+	proxy := flag.String("proxy", "https://gateway.battleofnodes.com", "")
+	gp := flag.Uint64("gas-price", 1_000_000_000, "")
+	boostL := flag.Int64("boost-limit", 3000, "")
+	boostGP := flag.Uint64("boost-gas-price", 2_000_000_000, "")
 	flag.Parse()
 
-	maxTxsLimit = *maxTxsFlag
-	baseGasPrice = *gasPriceFlag
-	boostLimit = *boostLimitFlag
-	boostGasPrice = *boostGasPriceFlag
+	maxTxsLimit, baseGasPrice, boostLimit, boostGasPrice = *maxTxs, *gp, *boostL, *boostGP
 	appStartTime = time.Now()
 
-	log.Printf("=== BoN Bot | dur=%v ct=%s proxy=%s maxTxs=%d gp=%d boostLim=%d boostGP=%d ===", 
-		*durationFlag, *callTypeFlag, *proxyFlag, maxTxsLimit, baseGasPrice, boostLimit, boostGasPrice)
+	workers, err := loadAllShards(*proxy)
+	if err != nil { log.Fatal(err) }
 
-	shardCallTypes := map[int][]string{
-		0: {"blindAsyncV1", "blindAsyncV2"}, // cross-shard: 2 types
-		1: {"blindTransfExec"},              // cross-shard: 1 type
-		2: {"blindSync"},                    // same-shard: 1 type
-	}
-	if *callTypeFlag != "auto" {
-		for k := range shardCallTypes {
-			shardCallTypes[k] = []string{*callTypeFlag}
-		}
-	}
-
-	stopCh := make(chan struct{})
+	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	txInterval := time.Duration(*intervalMsFlag) * time.Millisecond
+	txIntv := time.Duration(*intv) * time.Millisecond
 
-	var allWorkers []*ShardWorker
-	for _, cfg := range shards {
-		ct := shardCallTypes[cfg.ShardID]
-		shardWorkers, err := loadShardWorkers(*proxyFlag, cfg, ct)
-		if err != nil {
-			log.Fatalf("Init shard%d: %v", cfg.ShardID, err)
-		}
-		for _, w := range shardWorkers {
-			allWorkers = append(allWorkers, w)
-			wg.Add(1)
-			go w.Run(stopCh, &wg, txInterval, *batchSizeFlag)
-		}
+	for _, w := range workers {
+		wg.Add(1)
+		go w.Run(stop, &wg, txIntv, *batch)
 	}
 
-	// Start Prometheus metrics server on :2112
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		for _, worker := range allWorkers {
-			for i, ct := range worker.callTypes {
-				fmt.Fprintf(w, "bot_txs_sent_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, ct, worker.callTypeCounts[i].Load())
+	http.HandleFunc("/metrics", func(resp http.ResponseWriter, r *http.Request) {
+		for _, w := range workers {
+			if w.role == RoleSpammer {
+				fmt.Fprintf(resp, "bot_txs_sent_total{shard=\"%d\",addr=\"%s\",ct=\"%s\"} %d\n", w.cfg.ShardID, w.walletAddr[:10], w.callTypes[0], w.txCount.Load())
 			}
-			fmt.Fprintf(w, "bot_txs_error_total{shard=\"%d\"} %d\n", worker.cfg.ShardID, worker.errCount.Load())
 		}
 	})
-	go func() {
-		log.Println("Metrics available on :2112/metrics")
-		if err := http.ListenAndServe(":2112", nil); err != nil {
-			log.Printf("Metrics server error: %v", err)
-		}
-	}()
+	go http.ListenAndServe(":2112", nil)
+	go DrainWorker(*proxy, workers, 6*time.Second, stop)
 
-	// Drain worker fires drain() on cross-shard wallets periodically
-	go DrainWorker(*proxyFlag, allWorkers, time.Duration(*drainIntervalFlag)*time.Millisecond, stopCh)
-
-	// Stats every 10 seconds and max limit enforcer
 	go func() {
-		t := time.NewTicker(4 * time.Second)
-		defer t.Stop()
-		for range t.C {
-			total, errs := int64(0), int64(0)
-			for _, w := range allWorkers {
-				total += w.txCount.Load()
-				errs += w.errCount.Load()
-			}
-			log.Printf("[Stats] TXs=%d Errors=%d", total, errs)
-			if maxTxsLimit > 0 && total >= maxTxsLimit {
-				log.Printf("!!! MAX TX LIMIT %d REACHED, HALTING !!!", maxTxsLimit)
-				close(stopCh)
-				return
-			}
+		for range time.Tick(5 * time.Second) {
+			var t, e int64
+			for _, w := range workers { t += w.txCount.Load(); e += w.errCount.Load() }
+			log.Printf("[Stats] TXs=%d Errors=%d", t, e)
+			if maxTxsLimit > 0 && t >= maxTxsLimit { close(stop); return }
 		}
 	}()
 
 	select {
-	case <-time.After(*durationFlag):
-		log.Println("Duration completed.")
-		close(stopCh)
-	case <-stopCh:
-		// already closed by limit enforcer
+	case <-time.After(*dur): close(stop)
+	case <-stop:
 	}
-
 	wg.Wait()
-
-	total := int64(0)
-	for _, w := range allWorkers {
-		total += w.txCount.Load()
-	}
-	log.Printf("=== Finished. Total TXs: %d ===", total)
-	os.Exit(0)
 }
