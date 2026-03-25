@@ -27,7 +27,7 @@ type ShardConfig struct {
 }
 
 var (
-	proxy    = "https://gateway.battleofnodes.com"
+	proxy    = "http://127.0.0.1:7950"
 	chainID  = "B"
 	gasPrice = uint64(1_000_000_000)
 	gasLimit = uint64(10_000_000)
