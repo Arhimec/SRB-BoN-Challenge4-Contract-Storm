@@ -17,8 +17,15 @@ import (
 	"time"
 )
 
-var globalTxsSent atomic.Int64
-var maxTxsLimit int64
+var (
+	globalTxsSent atomic.Int64
+	maxTxsLimit   int64
+	appStartTime  time.Time
+	
+	baseGasPrice  uint64
+	boostGasPrice uint64
+	boostLimit    int64
+)
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -31,7 +38,6 @@ type ShardConfig struct {
 
 var (
 	chainID  = "B"
-	gasPrice = uint64(1_000_000_000)
 	gasLimit = uint64(10_000_000)
 
 	// identifer of the WEGLD token on BoN network
@@ -185,7 +191,13 @@ func dispatchTx(proxy string, shard ShardConfig, privKey ed25519.PrivateKey, non
 	if value != nil && value.Sign() > 0 {
 		valueStr = value.String()
 	}
-	tx := NewTx(nonce, shard.WalletAddress, shard.ContractAddress, valueStr, gasPrice, gasLimit, data, chainID, 2)
+	
+	gp := baseGasPrice
+	if globalTxsSent.Load() < boostLimit {
+		gp = boostGasPrice
+	}
+	
+	tx := NewTx(nonce, shard.WalletAddress, shard.ContractAddress, valueStr, gp, gasLimit, data, chainID, 2)
 	return broadcast(proxy, tx, privKey)
 }
 
@@ -255,7 +267,8 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	ct := w.callTypes[w.batchIndex % uint64(len(w.callTypes))]
 	
 	sendToken, expectToken, amt := wegldToken, "USDC-c76f1f", txAmountWegld
-	if w.batchIndex % 2 == 1 {
+	// AUTOMATED WARMUP: strictly use WEGLD for the first 20 seconds to guarantee USDC balance accrual
+	if time.Since(appStartTime) > 20*time.Second && w.batchIndex % 2 == 1 {
 		sendToken, expectToken, amt = "USDC-c76f1f", wegldToken, txAmountUsdc
 	}
 
@@ -263,8 +276,13 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	nonces := w.nonces.NextBatch(batchSize)
 	data := buildESDTCall(sendToken, amt, ct, expectToken)
 	
+	gp := baseGasPrice
+	if globalTxsSent.Load() < boostLimit {
+		gp = boostGasPrice
+	}
+
 	for i := 0; i < batchSize; i++ {
-		tx := NewTx(nonces[i], w.cfg.WalletAddress, w.cfg.ContractAddress, "0", gasPrice, gasLimit, data, chainID, 2)
+		tx := NewTx(nonces[i], w.cfg.WalletAddress, w.cfg.ContractAddress, "0", gp, gasLimit, data, chainID, 2)
 		txs = append(txs, tx)
 	}
 
@@ -282,7 +300,7 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	globalTxsSent.Add(int64(len(hashes)))
 	w.txCount.Add(int64(len(hashes)))
 	if len(hashes) > 0 {
-		log.Printf("[Shard%d] OK batch sent %d txs (first nonce=%d, hash=%s, ct=%s)", w.cfg.ShardID, len(hashes), nonces[0], hashes[0], ct)
+		log.Printf("[Shard%d] OK batch sent %d txs (first nonce=%d, hash=%s, ct=%s, gp=%d, expects=%s)", w.cfg.ShardID, len(hashes), nonces[0], hashes[0], ct, gp, expectToken)
 	}
 }
 
@@ -335,10 +353,20 @@ func main() {
 	batchSizeFlag := flag.Int("batch-size", 20, "Number of TXs to send in a single bulkBroadcast array")
 	maxTxsFlag := flag.Int64("max-txs", 0, "Stop the bot after reaching this global total of dispatched TXs to preserve gas budget")
 	proxyFlag := flag.String("proxy", "https://gateway.battleofnodes.com", "RPC proxy URL")
+	
+	gasPriceFlag := flag.Uint64("gas-price", 1_000_000_000, "Base gas price for all transactions")
+	boostLimitFlag := flag.Int64("boost-limit", 3000, "Number of initial transactions to apply boost-gas-price to")
+	boostGasPriceFlag := flag.Uint64("boost-gas-price", 2_000_000_000, "Elevated gas price for the first N transactions to secure the milestone bonus")
 	flag.Parse()
 
 	maxTxsLimit = *maxTxsFlag
-	log.Printf("=== BoN Bot | duration=%v callType=%s proxy=%s maxTxs=%d ===", *durationFlag, *callTypeFlag, *proxyFlag, maxTxsLimit)
+	baseGasPrice = *gasPriceFlag
+	boostLimit = *boostLimitFlag
+	boostGasPrice = *boostGasPriceFlag
+	appStartTime = time.Now()
+
+	log.Printf("=== BoN Bot | dur=%v ct=%s proxy=%s maxTxs=%d gp=%d boostLim=%d boostGP=%d ===", 
+		*durationFlag, *callTypeFlag, *proxyFlag, maxTxsLimit, baseGasPrice, boostLimit, boostGasPrice)
 
 	shardCallTypes := map[int][]string{
 		0: {"blindAsyncV1", "blindAsyncV2"}, // cross-shard: 2 types
