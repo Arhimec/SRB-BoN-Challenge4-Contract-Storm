@@ -316,8 +316,17 @@ func DrainWorker(proxy string, workers []*ShardWorker, interval time.Duration, s
 			return
 		case <-ticker.C:
 			for _, w := range workers {
+				// Claim Developer Rewards (All Shards)
+				nonceReward := w.nonces.Next()
+				hashReward, errReward := dispatchTx(proxy, w.cfg, w.privKey, nonceReward, "ClaimDeveloperRewards", nil)
+				if errReward != nil {
+					log.Printf("[Drain] Shard%d Rewards ERROR: %v", w.cfg.ShardID, errReward)
+				} else {
+					log.Printf("[Drain] Shard%d claimed Dev Rewards hash=%s", w.cfg.ShardID, hashReward)
+				}
+
 				if w.cfg.ShardID == 1 {
-					continue // same-shard: tokens return automatically
+					continue // same-shard: tokens return automatically, no manual drain needed
 				}
 				// Drain USDC
 				nonce1 := w.nonces.Next()
