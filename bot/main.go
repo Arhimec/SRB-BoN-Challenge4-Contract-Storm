@@ -10,7 +10,6 @@ import (
 	"log"
 	"math/big"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
