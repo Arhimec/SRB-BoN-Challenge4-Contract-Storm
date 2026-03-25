@@ -303,6 +303,21 @@ func main() {
 		go w.Run(stopCh, &wg, txInterval)
 	}
 
+	// Start Prometheus metrics server on :2112
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		for _, worker := range allWorkers {
+			fmt.Fprintf(w, "bot_txs_sent_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, worker.callType, worker.txCount.Load())
+			fmt.Fprintf(w, "bot_txs_error_total{shard=\"%d\",call_type=\"%s\"} %d\n", worker.cfg.ShardID, worker.callType, worker.errCount.Load())
+		}
+	})
+	go func() {
+		log.Println("Metrics available on :2112/metrics")
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			log.Printf("Metrics server error: %v", err)
+		}
+	}()
+
 	// Drain worker fires drain() on cross-shard wallets periodically
 	go DrainWorker(allWorkers, time.Duration(*drainIntervalFlag)*time.Millisecond, stopCh)
 
