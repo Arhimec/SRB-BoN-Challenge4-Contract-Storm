@@ -27,7 +27,7 @@ type ShardConfig struct {
 }
 
 var (
-	proxy    = "https://gateway.battleofnodes.com"
+	proxy    = "http://127.0.0.1:7950" // use local proxy for 0ms latency
 	chainID  = "B"
 	gasPrice = uint64(1_000_000_000)
 	gasLimit = uint64(10_000_000)
@@ -191,9 +191,9 @@ func NewShardWorker(cfg ShardConfig, callType string) (*ShardWorker, error) {
 
 // Run fires transactions as fast as possible until ctx is closed.
 // interval controls tx cadence; set to 0 for max throughput.
-func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.Duration) {
+func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.Duration, batchSize int) {
 	defer wg.Done()
-	log.Printf("[Shard%d] Start: callType=%s contract=%s", w.cfg.ShardID, w.callType, w.cfg.ContractAddress)
+	log.Printf("[Shard%d] Start: callType=%s contract=%s batchSize=%d", w.cfg.ShardID, w.callType, w.cfg.ContractAddress, batchSize)
 
 	if interval == 0 {
 		// fire-and-forget goroutine pool
@@ -203,7 +203,7 @@ func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.D
 				log.Printf("[Shard%d] Stop. TXs=%d Errors=%d", w.cfg.ShardID, w.txCount.Load(), w.errCount.Load())
 				return
 			default:
-				w.sendNext()
+				w.sendBatch(batchSize)
 			}
 		}
 	}
@@ -216,26 +216,38 @@ func (w *ShardWorker) Run(ctx chan struct{}, wg *sync.WaitGroup, interval time.D
 			log.Printf("[Shard%d] Stop. TXs=%d Errors=%d", w.cfg.ShardID, w.txCount.Load(), w.errCount.Load())
 			return
 		case <-ticker.C:
-			go w.sendNext()
+			go w.sendBatch(batchSize)
 		}
 	}
 }
 
-func (w *ShardWorker) sendNext() {
+func (w *ShardWorker) sendBatch(batchSize int) {
+	var txs []*Transaction
+	var nonces []uint64
 	data := buildESDTCall(wegldToken, txAmount, w.callType)
-	nonce := w.nonces.Next()
-	hash, err := dispatchTx(w.cfg, w.privKey, nonce, data, nil)
+	
+	for i := 0; i < batchSize; i++ {
+		nonce := w.nonces.Next()
+		nonces = append(nonces, nonce)
+		tx := NewTx(nonce, w.cfg.WalletAddress, w.cfg.ContractAddress, "0", gasPrice, gasLimit, data, chainID, 2)
+		txs = append(txs, tx)
+	}
+
+	hashes, err := bulkBroadcast(proxy, txs, w.privKey)
 	if err != nil {
-		w.errCount.Add(1)
+		w.errCount.Add(int64(batchSize))
 		errStr := err.Error()
 		if strings.Contains(errStr, "nonce too low") || strings.Contains(errStr, "nonce too high") {
 			w.nonces.Reset(w.cfg.WalletAddress)
 		}
-		log.Printf("[Shard%d] ERROR nonce=%d: %v", w.cfg.ShardID, nonce, err)
+		log.Printf("[Shard%d] ERROR batch %d txs: %v", w.cfg.ShardID, batchSize, err)
 		return
 	}
-	w.txCount.Add(1)
-	log.Printf("[Shard%d] OK nonce=%d hash=%s", w.cfg.ShardID, nonce, hash)
+	
+	w.txCount.Add(int64(len(hashes)))
+	if len(hashes) > 0 {
+		log.Printf("[Shard%d] OK batch sent %d txs (first nonce=%d, hash=%s)", w.cfg.ShardID, len(hashes), nonces[0], hashes[0])
+	}
 }
 
 // ─── DRAIN WORKER ────────────────────────────────────────────────────────────
@@ -270,11 +282,12 @@ func DrainWorker(workers []*ShardWorker, interval time.Duration, stop chan struc
 func main() {
 	durationFlag := flag.Duration("duration", 30*time.Minute, "How long to run the bot")
 	callTypeFlag := flag.String("calltype", "auto", "blindSync|blindAsyncV1|blindAsyncV2|blindTransfExec|auto")
-	intervalMsFlag := flag.Int("interval", 100, "Milliseconds between TXs per shard (0=max throughput)")
+	intervalMsFlag := flag.Int("interval", 100, "Milliseconds between TX batches per shard (0=max throughput)")
 	drainIntervalFlag := flag.Int("drain-interval", 6000, "Milliseconds between drain calls")
+	batchSizeFlag := flag.Int("batch-size", 20, "Number of TXs to send in a single bulkBroadcast array")
 	flag.Parse()
 
-	log.Printf("=== BoN Bot | duration=%v callType=%s interval=%dms ===", *durationFlag, *callTypeFlag, *intervalMsFlag)
+	log.Printf("=== BoN Bot | duration=%v callType=%s interval=%dms batch=%d ===", *durationFlag, *callTypeFlag, *intervalMsFlag, *batchSizeFlag)
 
 	shardCallTypes := map[int]string{
 		0: "blindAsyncV2",    // cross-shard: async with drain
@@ -300,7 +313,7 @@ func main() {
 		}
 		allWorkers = append(allWorkers, w)
 		wg.Add(1)
-		go w.Run(stopCh, &wg, txInterval)
+		go w.Run(stopCh, &wg, txInterval, *batchSizeFlag)
 	}
 
 	// Start Prometheus metrics server on :2112
