@@ -335,6 +335,9 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	
 	globalTxsSent.Add(int64(len(hashes)))
 	w.txCount.Add(int64(len(hashes)))
+	if w.batchIdx == 1 {
+		log.Printf("[Shard%d] Worker %s role=%s first_ct=%s", w.cfg.ShardID, w.walletAddr[:10], w.role, ct)
+	}
 }
 
 // ─── DRAIN WORKER ────────────────────────────────────────────────────────────
