@@ -162,17 +162,7 @@ func dispatchTx(shard ShardConfig, privKey ed25519.PrivateKey, nonce uint64, dat
 	if value != nil && value.Sign() > 0 {
 		valueStr = value.String()
 	}
-	tx := &Transaction{
-		Nonce:    nonce,
-		Value:    valueStr,
-		Receiver: shard.ContractAddress,
-		Sender:   shard.WalletAddress,
-		GasPrice: gasPrice,
-		GasLimit: gasLimit,
-		Data:     data,
-		ChainID:  chainID,
-		Version:  2,
-	}
+	tx := NewTx(nonce, shard.WalletAddress, shard.ContractAddress, valueStr, gasPrice, gasLimit, data, chainID, 2)
 	return broadcast(proxy, tx, privKey)
 }
 

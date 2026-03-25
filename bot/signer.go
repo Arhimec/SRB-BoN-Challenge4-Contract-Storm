@@ -64,7 +64,8 @@ func bech32Encode(hrp string, data []byte) string {
 	return hrp + "1" + hex.EncodeToString(data)[:58]
 }
 
-// Transaction represents a signed MultiversX transaction.
+// Transaction represents a signed MultiversX transaction (proxy wire format).
+// Data MUST be base64-encoded — the proxy decodes it internally.
 type Transaction struct {
 	Nonce     uint64 `json:"nonce"`
 	Value     string `json:"value"`
@@ -72,15 +73,27 @@ type Transaction struct {
 	Sender    string `json:"sender"`
 	GasPrice  uint64 `json:"gasPrice"`
 	GasLimit  uint64 `json:"gasLimit"`
-	Data      string `json:"data,omitempty"`
+	Data      string `json:"data,omitempty"` // base64-encoded transaction data
 	ChainID   string `json:"chainID"`
 	Version   int    `json:"version"`
 	Signature string `json:"signature,omitempty"`
 }
 
-// sign serializes the tx (without signature) and signs with ED25519.
+// NewTx creates a Transaction with data correctly base64-encoded.
+func NewTx(nonce uint64, sender, receiver, value string, gasPrice, gasLimit uint64, rawData, chainID string, version int) *Transaction {
+	dataB64 := ""
+	if rawData != "" {
+		dataB64 = base64.StdEncoding.EncodeToString([]byte(rawData))
+	}
+	return &Transaction{
+		Nonce: nonce, Value: value, Receiver: receiver, Sender: sender,
+		GasPrice: gasPrice, GasLimit: gasLimit, Data: dataB64,
+		ChainID: chainID, Version: version,
+	}
+}
+
+// sign serializes the tx (without signature) and ED25519-signs it.
 func sign(tx *Transaction, privKey ed25519.PrivateKey) error {
-	// Serialise without the Signature field for signing
 	type txForSigning struct {
 		Nonce    uint64 `json:"nonce"`
 		Value    string `json:"value"`
@@ -93,15 +106,9 @@ func sign(tx *Transaction, privKey ed25519.PrivateKey) error {
 		Version  int    `json:"version"`
 	}
 	toSign := txForSigning{
-		Nonce:    tx.Nonce,
-		Value:    tx.Value,
-		Receiver: tx.Receiver,
-		Sender:   tx.Sender,
-		GasPrice: tx.GasPrice,
-		GasLimit: tx.GasLimit,
-		Data:     tx.Data,
-		ChainID:  tx.ChainID,
-		Version:  tx.Version,
+		Nonce: tx.Nonce, Value: tx.Value, Receiver: tx.Receiver,
+		Sender: tx.Sender, GasPrice: tx.GasPrice, GasLimit: tx.GasLimit,
+		Data: tx.Data, ChainID: tx.ChainID, Version: tx.Version,
 	}
 	serialized, err := json.Marshal(toSign)
 	if err != nil {
