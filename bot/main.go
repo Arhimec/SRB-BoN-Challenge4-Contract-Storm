@@ -121,7 +121,14 @@ func amountHex(amount *big.Int) string {
 var txAmount = new(big.Int).Mul(big.NewInt(1), new(big.Int).Exp(big.NewInt(10), big.NewInt(15), nil))
 
 func buildESDTCall(tokenID string, amount *big.Int, fn string) string {
-	return fmt.Sprintf("ESDTTransfer@%s@%s@%s", hexEncode(tokenID), amountHex(amount), hexEncode(fn))
+	destHex := "0000000000000000050019e6ab48171f0381c319cb2ccd108d5ca08ee19c0001" // Target DEX pair
+	endpointHex := hexEncode("swapTokensFixedInput")
+	argTokenHex := hexEncode("USDC-c76f1f")
+	argAmountHex := "01"
+
+	return fmt.Sprintf("ESDTTransfer@%s@%s@%s@%s@%s@%s@%s", 
+		hexEncode(tokenID), amountHex(amount), hexEncode(fn),
+		destHex, endpointHex, argTokenHex, argAmountHex)
 }
 
 // ─── NETWORK HELPERS ─────────────────────────────────────────────────────────
@@ -274,13 +281,25 @@ func DrainWorker(workers []*ShardWorker, interval time.Duration, stop chan struc
 				if w.cfg.ShardID == 1 {
 					continue // same-shard: tokens return automatically
 				}
-				nonce := w.nonces.Next()
-				hash, err := dispatchTx(w.cfg, w.privKey, nonce, "drain", nil)
-				if err != nil {
-					log.Printf("[Drain] Shard%d ERROR: %v", w.cfg.ShardID, err)
-					continue
+				// Drain USDC
+				nonce1 := w.nonces.Next()
+				drainUSDC := fmt.Sprintf("drain@%s", hexEncode("USDC-c76f1f"))
+				hash1, err1 := dispatchTx(w.cfg, w.privKey, nonce1, drainUSDC, nil)
+				if err1 != nil {
+					log.Printf("[Drain] Shard%d USDC ERROR: %v", w.cfg.ShardID, err1)
+				} else {
+					log.Printf("[Drain] Shard%d drain USDC sent hash=%s", w.cfg.ShardID, hash1)
 				}
-				log.Printf("[Drain] Shard%d drain sent hash=%s", w.cfg.ShardID, hash)
+
+				// Drain WEGLD
+				nonce2 := w.nonces.Next()
+				drainWEGLD := fmt.Sprintf("drain@%s", hexEncode(wegldToken))
+				hash2, err2 := dispatchTx(w.cfg, w.privKey, nonce2, drainWEGLD, nil)
+				if err2 != nil {
+					log.Printf("[Drain] Shard%d WEGLD ERROR: %v", w.cfg.ShardID, err2)
+				} else {
+					log.Printf("[Drain] Shard%d drain WEGLD sent hash=%s", w.cfg.ShardID, hash2)
+				}
 			}
 		}
 	}

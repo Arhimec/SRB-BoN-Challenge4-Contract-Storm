@@ -3,6 +3,8 @@ set password "Tl3X9303gtHi6LjpRG"
 set ip "173.249.39.152"
 set cmd [lindex $argv 0]
 
+set timeout -1
+
 spawn ssh -o StrictHostKeyChecking=no root@$ip $cmd
 
 expect {
