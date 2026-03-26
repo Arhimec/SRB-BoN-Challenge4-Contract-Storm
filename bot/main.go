@@ -37,7 +37,7 @@ type ShardConfig struct {
 
 var (
 	chainID  = "B"
-	gasLimit = uint64(10_000_000)
+	gasLimit = uint64(20_000_000)
 
 	// identifer of the WEGLD token on BoN network
 	wegldToken = "WEGLD-bd4d79"
@@ -330,6 +330,7 @@ func (w *ShardWorker) sendBatch(batchSize int) {
 	hashes, err := bulkBroadcast(w.proxy, txs, w.privKey)
 	if err != nil {
 		w.errCount.Add(int64(batchSize))
+		log.Printf("[%s] Error: %v", w.walletAddr[:10], err)
 		if strings.Contains(err.Error(), "nonce") { w.nonces.Reset(w.walletAddr) }
 		return
 	}
@@ -407,8 +408,6 @@ func main() {
 		for _, w := range workers {
 			if w.role == RoleSpammer {
 				fmt.Fprintf(resp, "bot_txs_sent_total{shard=\"%d\",addr=\"%s\",ct=\"%s\"} %d\n", w.cfg.ShardID, w.walletAddr[:10], w.callTypes[0], w.txCount.Load())
-				// We'll report balance in EGLD
-				fmt.Fprintf(resp, "bot_wallet_balance{shard=\"%d\",addr=\"%s\"} %f\n", w.cfg.ShardID, w.walletAddr[:10], w.balance.Load())
 			}
 		}
 	})

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -165,7 +166,7 @@ func sign(tx *Transaction, privKey ed25519.PrivateKey) error {
 	toSign := txForSigning{
 		Nonce: tx.Nonce, Value: tx.Value, Receiver: tx.Receiver,
 		Sender: tx.Sender, GasPrice: tx.GasPrice, GasLimit: tx.GasLimit,
-		Data: tx.Data, ChainID: tx.ChainID, Version: tx.Version,
+		Data: tx.Data, ChainID: tx.ChainID, Version: 2,
 	}
 	serialized, err := json.Marshal(toSign)
 	if err != nil {
@@ -215,6 +216,7 @@ func broadcast(proxyURL string, tx *Transaction, privKey ed25519.PrivateKey) (st
 // bulkBroadcast sends multiple signed transactions in a single request.
 func bulkBroadcast(proxyURL string, txs []*Transaction, privKey ed25519.PrivateKey) ([]string, error) {
 	for _, tx := range txs {
+		tx.Version = 2
 		if err := sign(tx, privKey); err != nil {
 			return nil, err
 		}
@@ -231,9 +233,11 @@ func bulkBroadcast(proxyURL string, txs []*Transaction, privKey ed25519.PrivateK
 		Error string `json:"error"`
 	}
 	if err := json.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal error: %v, body: %s", err, string(resp))
+		log.Printf("Proxy Raw Response: %s", string(resp))
+		return nil, fmt.Errorf("unmarshal error: %v", err)
 	}
 	if result.Error != "" {
+		log.Printf("Proxy Error Response: %s", string(resp))
 		return nil, fmt.Errorf("proxy: %s", result.Error)
 	}
 	
