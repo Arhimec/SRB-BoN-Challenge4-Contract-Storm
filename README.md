@@ -3,7 +3,7 @@
 # 🐻 SuperRareBears — Battle of Nodes
 ### Guild Wars Challenge 4: Contract Storm ⚡
 
-A high-throughput, cross-shard transaction bot and smart contract deployment suite for the **MultiversX Battle of Nodes** network.
+A high-throughput, distributed bot fleet for the **MultiversX Battle of Nodes** network.
 
 [![Built with Go](https://img.shields.io/badge/Built_with-Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
 [![MultiversX](https://img.shields.io/badge/Network-MultiversX-1D2124?style=for-the-badge&logo=multiversx&logoColor=white)](https://multiversx.com/)
@@ -14,61 +14,74 @@ A high-throughput, cross-shard transaction bot and smart contract deployment sui
 
 ## 🚀 Overview
 
-This repository contains the `SuperRareBears` guild's implementation for **Challenge 4: Contract Storm**. The goal of this challenge is to maximize smart contract composability transactions across all three shards on the MultiversX network.
+The `SuperRareBears` fleet is a distributed system designed to maximize smart contract composability transactions for **Challenge 4: Contract Storm**. It scales across multiple VPS nodes to hit 500+ TPS across all three shards.
 
-### Architecture
+### 🌐 Distributed Architecture
 
-1.  **Smart Contracts (`mx-contracts-rs`)**:
-    We utilize the `forwarder-blind` reference contract, compiled to WASM and deployed individually on Shards 0, 1, and 2.
-2.  **High-Concurrency Bot (`bot/`)**:
-    A custom-built, multi-threaded worker bot written in **Go**. It employs local nonce management and ED25519 signing via `mx-sdk-go` to maximize transaction throughput without waiting for block confirmations.
+The fleet is distributed across 3 high-performance VPS nodes, each handling a specific shard to maximize parallel processing and avoid gateway rate limits:
 
-## 🎯 Bot Features
+| Role | Node IP | Responsibility | Wallets |
+| :--- | :--- | :--- | :--- |
+| **Master** | `173.249.39.152` | Shard 1 + TUI + Prometheus | 49 |
+| **Worker 1** | `84.247.173.193` | Shard 0 | 25 |
+| **Worker 2** | `84.247.131.137` | Shard 2 | 25 |
 
--   **Multi-Shard Workers**: Dedicated parallel workers for Shard 0, Shard 1, and Shard 2.
--   **Local Nonce Management**: Tracks nonces locally to allow hundreds of transactions to be broadcasted simultaneously.
--   **Dynamic Call Types**: Supports all 4 competition interactions:
-    -   `blindSync` (Same-shard efficiency)
-    -   `blindAsyncV1`
-    -   `blindAsyncV2`
-    -   `blindTransfExec`
--   **Automated Drain Tracking**: A background goroutine periodically fires `drain` calls on cross-shard contracts to release locked tokens automatically.
+---
 
-## 🛠️ Quick Start
+## 🎯 System Components
 
-### 1. Requirements
+### 1. High-Concurrency Bot (`bot/`)
+The core engine is a multi-threaded Go bot that manages 99 wallets.
+- **Shard-Specific Loading**: Optimized to load only local shard PEMs on each VPS.
+- **Bulk Broadcast**: Uses optimized transaction batching for maximum delivery.
+- **Dynamic Call Types**: Cycles through `blindSync`, `blindAsyncV1`, `blindAsyncV2`, and `blindTransfExec`.
 
--   [Go 1.22+](https://go.dev/dl/)
--   MultiversX WALLET `.pem` files for all 3 shards.
+### 2. Unified Monitoring (`tui_unified.go`)
+A branded terminal dashboard that aggregates metrics from all 3 nodes via Prometheus.
+- **Real-time TPS**: Live tracking of fleet-wide throughput.
+- **Qualification Progress**: tracks the 300-transaction minimum requirement per interaction type.
 
-### 2. Building the Bot
+### 3. Operational Suite
+- `drain_all.go`: Sweeps EGLD, WEGLD, and USDC from all 99 wallets to a master address.
+- `disperse_final.go`: Automates funding across the entire fleet.
+- `prometheus.yml`: Configuration for the cross-node monitoring stack.
 
+---
+
+## 🛠️ Operational Guide
+
+### 1. Draining Wallets
+Before starting a fresh run, ensure all wallets are clean:
 ```bash
-cd bot
-go build -o bon-bot .
+./drain_all /root/wallets/shardX <MASTER_ADDR>
 ```
 
-### 3. Running the Bot
-
-For the competition phase, adjust the interval down for maximum TPS:
-
+### 2. Launching the Attack
+On each VPS, launch the bot using the optimized BoN settings:
 ```bash
-# Run for 2 hours, using auto-strategy, with 10 tx/s per shard
-./bon-bot -duration 2h -calltype auto -interval 100 -drain-interval 6000
+nohup ./bot_bin -duration=60m -proxy=https://gateway.battleofnodes.com -interval=500 -batch-size=3 -boost-limit=3000 -boost-gas-price=2000000000 > bot.log 2>&1 &
 ```
 
-*Set `-interval 0` to uncap the rate limit (warning: requires sufficient WEGLD for gas!).*
+### 3. Monitoring Progress
+SSH into the **Master Node** (VPS 1) and run the unified TUI:
+```bash
+./tui_bin
+```
+
+---
 
 ## 📁 Repository Structure
 
 ```text
 .
-├── bot/
-│   ├── go.mod        # Go dependencies
-│   ├── main.go       # Core bot logic & workers
-│   └── signer.go     # ED25519 tx signer & broadcaster
-├── install_vps.sh    # VPS bootstrapping script (Go, Docker, Monitoring)
-└── scripts/          # EGLD/WEGLD funding & deploy helpers
+├── bot/                # Core bot engine
+├── genwallets/         # Wallet generation utility
+├── scripts/            # Deployment & funding helpers
+├── drain_all.go        # Wallet cleanup utility
+├── disperse_final.go   # Mass funding utility
+├── tui_unified.go      # Unified dashboard source
+├── install_vps.sh      # Environment bootstrap
+└── prometheus.yml      # Monitoring config
 ```
 
 ---
