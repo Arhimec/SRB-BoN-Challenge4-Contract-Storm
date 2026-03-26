@@ -235,7 +235,8 @@ func loadAllShards(proxy string) ([]*ShardWorker, error) {
 	for _, cfg := range shards {
 		entries, _ := filepath.Glob(filepath.Join(cfg.WalletsDir, "*.pem"))
 		if len(entries) == 0 {
-			return nil, fmt.Errorf("no wallets for shard %d", cfg.ShardID)
+			log.Printf("[Shard%d] No wallets found in %s, skipping.", cfg.ShardID, cfg.WalletsDir)
+			continue
 		}
 		
 		// Partition counts according to user spec
