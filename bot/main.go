@@ -407,6 +407,8 @@ func main() {
 		for _, w := range workers {
 			if w.role == RoleSpammer {
 				fmt.Fprintf(resp, "bot_txs_sent_total{shard=\"%d\",addr=\"%s\",ct=\"%s\"} %d\n", w.cfg.ShardID, w.walletAddr[:10], w.callTypes[0], w.txCount.Load())
+				// We'll report balance in EGLD
+				fmt.Fprintf(resp, "bot_wallet_balance{shard=\"%d\",addr=\"%s\"} %f\n", w.cfg.ShardID, w.walletAddr[:10], w.balance.Load())
 			}
 		}
 	})
@@ -427,4 +429,6 @@ func main() {
 	case <-stop:
 	}
 	wg.Wait()
+	log.Println("Test finished, keeping metrics alive for 60s...")
+	time.Sleep(60 * time.Second)
 }

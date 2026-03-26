@@ -1,0 +1,21 @@
+#!/usr/bin/expect -f
+set ip [lindex $argv 0]
+set src [lindex $argv 1]
+set dst [lindex $argv 2]
+set password "Tl3X9303gtHi6LjpRG"
+
+set timeout -1
+
+spawn scp -o StrictHostKeyChecking=no $src root@$ip:$dst
+
+expect {
+    "yes/no" {
+        send "yes\r"
+        exp_continue
+    }
+    "password:" {
+        send "$password\r"
+        exp_continue
+    }
+    eof
+}

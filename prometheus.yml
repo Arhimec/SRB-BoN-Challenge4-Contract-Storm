@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 2s
+
+scrape_configs:
+  - job_name: 'bot_metrics'
+    static_configs:
+      - targets:
+          - 'localhost:2112'
+          - '84.247.173.193:2112'
+          - '84.247.131.137:2112'
