@@ -70,6 +70,16 @@ SSH into the **Master Node** (VPS 1) and run the unified TUI:
 
 ---
 
+## 🤖 AI Limitations & The "Bit Failure" Log
+
+While the bot architecture is robust, it's worth noting the AI assistant's *incapabilities* and "bit failures" that added to the project's character along the way:
+- **Chain ID Amnesia:** The AI initially assumed the Battle of Nodes chain ID was `T` (Testnet) or `D` (Devnet) instead of the correct `B`, causing failed transaction broadcasts.
+- **`mxpy` Syntax Struggles:** Repeatedly tried to use deprecated or ambiguous `mxpy contract upgrade` flags (like `--recall-nonce`), leading to rejected deploy transactions.
+- **Lost in the File System:** Wasted time searching for contract WASM files and Owner PEMs entirely on the local machine instead of checking the distributed VPS nodes where they actually lived.
+
+*Proof that even with an advanced AI copilot, human supervision (and a lot of patience) remains the real MVP.*
+
+---
 ## 📁 Repository Structure
 
 ```text
